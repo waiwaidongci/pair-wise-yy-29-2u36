@@ -1,5 +1,57 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字凭证服务</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style>
-<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
-<script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+table{border-collapse:collapse;margin:12px 0}
+th,td{border:1px solid #cbd2d9;padding:6px 10px;text-align:left}
+.ok{color:#0a7d2c;font-weight:600}.bad{color:#b3261e;font-weight:600}
+</style>
+<h1>数字凭证签发与验证</h1>
+<p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。断网考点使用签发方发布的撤销名单快照离线核验：快照过期、版本倒退或签名不符时停在待联网复核，不给出有效结论。</p>
+<h2>撤销名单快照</h2>
+<table id="snapshots"></table>
+<button onclick="loadState()">刷新状态</button>
+<pre id="state">加载中...</pre>
+<script>
+async function loadState(){
+  const data = await (await fetch('/api/state')).json();
+  document.getElementById('state').textContent = JSON.stringify(data, null, 2);
+  renderSnapshots(data.snapshots || []);
+}
+function renderSnapshots(list){
+  const table = document.getElementById('snapshots');
+  table.replaceChildren();
+  const head = table.insertRow();
+  for (const label of ['签发方','版本范围','快照数','最新生成时间','最新过期时间','名单条目','当前是否可用']) {
+    const th = document.createElement('th');
+    th.textContent = label;
+    head.appendChild(th);
+  }
+  if (!list.length) {
+    const td = table.insertRow().insertCell();
+    td.colSpan = 7;
+    td.textContent = '尚未发布快照';
+    return;
+  }
+  for (const s of list) {
+    const tr = table.insertRow();
+    const cells = [
+      s.issuer,
+      'v' + s.min_version + ' – v' + s.max_version,
+      s.snapshot_count,
+      s.latest_generated_at,
+      s.latest_expires_at,
+      s.latest_entries,
+      s.usable_now ? '可用' : '已过期',
+    ];
+    cells.forEach((text, i) => {
+      const td = tr.insertCell();
+      td.textContent = text;
+      if (i === cells.length - 1) td.className = s.usable_now ? 'ok' : 'bad';
+    });
+  }
+}
+loadState();
+</script>
 </html>

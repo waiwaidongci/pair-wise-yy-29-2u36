@@ -12,37 +12,17 @@ import secrets
 import sqlite3
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from common import ApiError, canonical, iso, now, parse_time
+from snapshot_publisher import SnapshotPublisher
+from snapshot_store import SnapshotStore
+from snapshot_verifier import SnapshotVerifier
+
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    return (value or now()).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def parse_time(value: str | None) -> datetime:
-    if not value:
-        return now()
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
 
 
 class Store:
@@ -329,7 +309,8 @@ class CredentialService:
         self.conn.commit()
         return {"token": token, "payload": payload, "signature": signature, "disclosed_fields": disclosed}
 
-    def verify(self, token: str, at: str | None = None, online: bool = True) -> dict:
+    def authenticate_token(self, token: str) -> tuple[dict, sqlite3.Row, sqlite3.Row]:
+        """Decode a presentation token and verify the credential signature."""
         if not token:
             raise ApiError(400, "缺少凭证令牌")
         try:
@@ -348,6 +329,10 @@ class CredentialService:
         expected = hmac.new(bytes.fromhex(key["secret_hex"]), canonical(payload), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, str(supplied_signature)):
             raise ApiError(400, "凭证签名无效")
+        return payload, credential, key
+
+    def verify(self, token: str, at: str | None = None, online: bool = True) -> dict:
+        payload, credential, key = self.authenticate_token(token)
         check_at = parse_time(at)
         expiration = parse_time(credential["valid_until"])
         result = {"valid": True, "status": "valid", "key_retired": key["status"] == "retired", "claims": payload.get("claims", {})}
@@ -392,6 +377,9 @@ class CredentialService:
 
 class Handler(BaseHTTPRequestHandler):
     service: CredentialService
+    snapshots: SnapshotStore
+    publisher: SnapshotPublisher
+    verifier: SnapshotVerifier
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -422,7 +410,9 @@ class Handler(BaseHTTPRequestHandler):
             if parts == ["health"] or parts == ["api", "health"]:
                 return self._json(200, {"status": "ok"})
             if parts == ["api", "state"]:
-                return self._json(200, self.service.state())
+                data = self.service.state()
+                data["snapshots"] = self.snapshots.status()
+                return self._json(200, data)
             if not parts:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -456,8 +446,13 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.present(actor, role, int(parts[2]), body.get("disclosed_fields"))
             elif len(parts) == 4 and parts[:2] == ["api", "disputes"] and parts[3] == "resolve":
                 result = self.service.resolve_dispute(actor, role, int(parts[2]), body.get("decision", ""), body.get("resolution", ""))
+            elif parts == ["api", "snapshots"]:
+                result = self.publisher.publish(actor, role, body.get("issuer", actor or ""), body.get("ttl_seconds"))
             elif parts == ["api", "verify"]:
-                result = self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)))
+                if body.get("snapshot") is not None:
+                    result = self.verifier.verify(body.get("token", ""), body["snapshot"], body.get("at"))
+                else:
+                    result = self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)))
             else:
                 raise ApiError(404, "接口不存在")
             self._json(200, result)
@@ -472,9 +467,13 @@ class Handler(BaseHTTPRequestHandler):
 def run(port: int, db_path: str, seed: bool) -> None:
     store = Store(db_path)
     service = CredentialService(store)
+    snapshots = SnapshotStore(store)
     if seed:
         service.seed()
     Handler.service = service
+    Handler.snapshots = snapshots
+    Handler.publisher = SnapshotPublisher(store, snapshots)
+    Handler.verifier = SnapshotVerifier(service, snapshots)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"digital credentials listening on http://127.0.0.1:{port}")
     server.serve_forever()
