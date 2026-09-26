@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import hmac
 import json
@@ -12,37 +11,17 @@ import secrets
 import sqlite3
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from credential_utils import ApiError, canonical, iso, now, parse_time, read_envelope, sign_envelope
+from revocation_snapshot import SnapshotPublisher
+from snapshot_store import SnapshotStore
+from snapshot_verify import SnapshotVerifier
+
 DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    return (value or now()).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def parse_time(value: str | None) -> datetime:
-    if not value:
-        return now()
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
 
 
 class Store:
@@ -53,6 +32,7 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.init_schema()
+        self.snapshots = SnapshotStore(self.conn)
 
     def init_schema(self) -> None:
         self.conn.executescript(
@@ -135,6 +115,8 @@ class CredentialService:
     def __init__(self, store: Store):
         self.store = store
         self.conn = store.conn
+        self.snapshot_publisher = SnapshotPublisher(store.conn, store.snapshots)
+        self.snapshot_verifier = SnapshotVerifier(store.conn, store.snapshots)
 
     @staticmethod
     def _required_actor(actor: str | None, role: str | None, expected: str) -> str:
@@ -323,21 +305,29 @@ class CredentialService:
         key = self.conn.execute(
             "SELECT secret_hex FROM key_versions WHERE issuer=? AND version=?", (credential["issuer"], credential["key_version"])
         ).fetchone()
-        signature = hmac.new(bytes.fromhex(key["secret_hex"]), canonical(payload), hashlib.sha256).hexdigest()
-        token = base64.urlsafe_b64encode(canonical({"payload": payload, "signature": signature})).decode().rstrip("=")
+        token, signature = sign_envelope(payload, key["secret_hex"])
         self.store.audit(actor, "credential.present", "credential", credential_id, {"disclosed_fields": disclosed})
         self.conn.commit()
         return {"token": token, "payload": payload, "signature": signature, "disclosed_fields": disclosed}
 
-    def verify(self, token: str, at: str | None = None, online: bool = True) -> dict:
+    def publish_snapshot(self, actor: str | None, role: str | None, issuer: str, ttl_hours: int = 24) -> dict:
+        actor = self._required_actor(actor, role, "issuer")
+        if actor != issuer:
+            raise ApiError(403, "只能发布本机构的撤销快照")
+        try:
+            with self.conn:
+                snapshot = self.snapshot_publisher.publish(issuer, ttl_hours)
+                self.store.audit(actor, "snapshot.publish", "revocation_snapshot", snapshot["id"], {"version": snapshot["version"], "entries_count": snapshot["entries_count"], "expires_at": snapshot["expires_at"]})
+        except sqlite3.IntegrityError as exc:
+            raise ApiError(409, "快照版本冲突，请重试") from exc
+        return snapshot
+
+    def verify(self, token: str, at: str | None = None, online: bool = True, snapshot: str | None = None) -> dict:
         if not token:
             raise ApiError(400, "缺少凭证令牌")
         try:
-            padded = token + "=" * (-len(token) % 4)
-            envelope = json.loads(base64.urlsafe_b64decode(padded.encode()))
-            payload = envelope["payload"]
-            supplied_signature = envelope["signature"]
-        except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            payload, supplied_signature = read_envelope(token)
+        except ValueError as exc:
             raise ApiError(400, "凭证令牌格式错误") from exc
         credential = self._row("credentials", int(payload.get("credential_id", 0)))
         key = self.conn.execute(
@@ -353,6 +343,13 @@ class CredentialService:
         result = {"valid": True, "status": "valid", "key_retired": key["status"] == "retired", "claims": payload.get("claims", {})}
         if check_at >= expiration:
             result.update(valid=False, status="expired", reason="凭证已过期")
+        elif not online:
+            result["offline"] = True
+            if snapshot:
+                result.update(self.snapshot_verifier.judge(credential, snapshot, check_at))
+            else:
+                result["status"] = "valid_offline"
+                result["revocation_freshness"] = "needs_online_check"
         elif credential["status"] == "disputed":
             result.update(valid=False, status="disputed", reason="撤销决定正在争议复核")
         elif credential["status"] == "revoked":
@@ -361,11 +358,6 @@ class CredentialService:
                 result.update(valid=False, status="revoked", reason=credential["revocation_reason"])
             else:
                 result.update(status="valid_until_revocation", revocation_starts_at=credential["revocation_effective_at"])
-        if not online:
-            result["offline"] = True
-            result["revocation_freshness"] = "needs_online_check"
-            if result["valid"]:
-                result["status"] = "valid_offline"
         self.conn.commit()
         return result
 
@@ -381,7 +373,8 @@ class CredentialService:
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
         templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
-        return {"templates": templates, "credentials": credentials, "audits": audits}
+        snapshots = self.store.snapshots.summary(iso())
+        return {"templates": templates, "credentials": credentials, "audits": audits, "snapshots": snapshots}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM key_versions LIMIT 1").fetchone():
@@ -456,8 +449,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.present(actor, role, int(parts[2]), body.get("disclosed_fields"))
             elif len(parts) == 4 and parts[:2] == ["api", "disputes"] and parts[3] == "resolve":
                 result = self.service.resolve_dispute(actor, role, int(parts[2]), body.get("decision", ""), body.get("resolution", ""))
+            elif parts == ["api", "snapshots"]:
+                result = self.service.publish_snapshot(actor, role, body.get("issuer", actor or ""), int(body.get("ttl_hours", 24)))
             elif parts == ["api", "verify"]:
-                result = self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)))
+                result = self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)), body.get("snapshot"))
             else:
                 raise ApiError(404, "接口不存在")
             self._json(200, result)

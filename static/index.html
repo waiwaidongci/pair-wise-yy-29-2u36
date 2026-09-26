@@ -1,5 +1,18 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字凭证服务</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style>
-<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
-<script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script>
+<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 10px;text-align:left}</style>
+<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。断网考点核验时在 <code>POST /api/verify</code> 中附带撤销快照令牌与核验时刻。</p>
+<h2>撤销快照</h2><div id="snapshots">加载中...</div>
+<button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
+<script>
+async function loadState(){
+  const data=await (await fetch('/api/state')).json();
+  state.textContent=JSON.stringify(data,null,2);
+  const rows=data.snapshots||[];
+  snapshots.innerHTML=rows.length
+    ?"<table><tr><th>签发方</th><th>版本范围</th><th>最新生成时间</th><th>最新过期时间</th><th>当前是否可用</th></tr>"+
+      rows.map(s=>`<tr><td>${s.issuer}</td><td>v${s.min_version} – v${s.latest_version}（共 ${s.count} 份）</td><td>${s.latest_generated_at}</td><td>${s.latest_expires_at}</td><td>${s.usable_now?"可用":"已过期"}</td></tr>`).join("")+"</table>"
+    :"<p>尚未发布撤销快照。</p>";
+}
+loadState()
+</script>
 </html>
